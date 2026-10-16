@@ -1,57 +1,92 @@
-# Solución al error `Forbidden`
+# Corrección: faders lentos y error `StripDenoiser`
 
-El error ocurre porque MeeterLink usa `aiohttp.static` para servir la carpeta `web/`. Ese servidor no entrega automáticamente `index.html` cuando abres una ruta de directorio como:
+Hay dos problemas distintos:
 
-```text
-http://IP:8080/mobile/
-```
+## 1. Error `float() argument must be a string or a real number, not 'StripDenoiser'`
 
-Por eso devuelve `403 Forbidden`.
-
-## Solución rápida
-
-Abre directamente el archivo:
-
-```text
-http://IP-DE-TU-PC:8080/mobile/index.html
-```
-
-Eso debería cargar la PWA sin modificar MeeterLink.
-
-## Solución definitiva
-
-Edita `main.py` de MeeterLink y localiza este bloque al final:
+Es un bug del `rec_strips` de MeeterLink. Aunque la app no envíe `denoiser`, esta línea intenta asignar el objeto completo como valor:
 
 ```python
-if __name__ == '__main__':
-    app = web.Application()
-    app.router.add_get('/', index)
-    app.router.add_get('/ws', websocket_handler)
-    app.router.add_static('/', path=os.path.join(FILE_DIR, 'web'), name='web')
+strip.denoiser.knob = data['values'].get('denoiser', strip.denoiser)
 ```
 
-Reemplázalo por:
+### Corrección
+
+En `main.py` de MeeterLink, busca:
 
 ```python
-if __name__ == '__main__':
-    app = web.Application()
-
-    async def mobile_index(request):
-        return web.FileResponse(
-            os.path.join(FILE_DIR, 'web', 'mobile', 'index.html')
-        )
-
-    app.router.add_get('/', index)
-    app.router.add_get('/mobile', mobile_index)
-    app.router.add_get('/mobile/', mobile_index)
-    app.router.add_get('/ws', websocket_handler)
-    app.router.add_static('/', path=os.path.join(FILE_DIR, 'web'), name='web')
+if hasattr(strip, 'denoiser'):
+    strip.denoiser.knob = data['values'].get('denoiser', strip.denoiser)
 ```
 
-Guarda, reinicia MeeterLink y abre:
+Y reemplázalo por:
 
-```text
-http://IP-DE-TU-PC:8080/mobile/
+```python
+if hasattr(strip, 'denoiser') and 'denoiser' in data['values']:
+    strip.denoiser.knob = data['values']['denoiser']
 ```
 
-La ruta `/mobile/index.html` también seguirá funcionando.
+## 2. Actualización de ganancia casi en tiempo real
+
+Para que un movimiento de fader que solo cambia `gain` no pase por todo el bloque de actualización —ni por el bug del denoiser—, añade este bloque al inicio de `rec_strips`, justo después de `strip = server['vm'].strip[data['index']]`:
+
+```python
+if set(data['values'].keys()) == {'gain'}:
+    strip.gain = data['values']['gain']
+    return
+```
+
+El bloque debe quedar así:
+
+```python
+async def rec_strips(ws, data):
+    try:
+        strip = server['vm'].strip[data['index']]
+
+        if set(data['values'].keys()) == {'gain'}:
+            strip.gain = data['values']['gain']
+            return
+
+        strip.label = data['values'].get('label', strip.label)
+        # ... el resto sigue igual
+```
+
+Haz lo mismo para `rec_busses`, después de obtener el bus:
+
+```python
+async def rec_busses(ws, data):
+    try:
+        bus = server['vm'].bus[data['index']]
+
+        if set(data['values'].keys()) == {'gain'}:
+            bus.gain = data['values']['gain']
+            return
+
+        bus.label = data['values'].get('label', bus.label)
+        # ... el resto sigue igual
+```
+
+## 3. Revisar `config.toml`
+
+Abre `config.toml` de MeeterLink y busca `polling_interval`. Para que la interfaz reciba el estado con más frecuencia, usa:
+
+```toml
+[general]
+polling_interval = 0.05
+```
+
+Y, si existe:
+
+```tomn
+[levels]
+polling_interval = 0.05
+```
+
+Esto mejora la frecuencia de refresco de estado y medidores; la corrección del `gain` es la que elimina la espera al aplicar el volumen.
+
+## Después del cambio
+
+1. Guarda `main.py` y `config.toml`.
+2. Cierra MeeterLink completamente.
+3. Vuelve a ejecutarlo.
+4. Recarga la PWA en el móvil, idealmente borrando datos del sitio para invalidar el service worker.
